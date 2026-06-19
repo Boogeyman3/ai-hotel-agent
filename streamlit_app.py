@@ -26,13 +26,14 @@ except Exception:
 st.set_page_config(page_title="AI Hotel Agent", page_icon="🏨", layout="wide")
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
-GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
+GROQ_MODEL = st.secrets.get("GROQ_MODEL", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
+GROQ_VISION_MODEL = st.secrets.get("GROQ_VISION_MODEL", os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"))
+GROQ_STT_MODEL = st.secrets.get("GROQ_STT_MODEL", os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo"))
 
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD")
+EMAIL_USER = st.secrets.get("EMAIL_USER", os.getenv("EMAIL_USER"))
+EMAIL_APP_PASSWORD = st.secrets.get("EMAIL_APP_PASSWORD", os.getenv("EMAIL_APP_PASSWORD"))
+UPI_ID = st.secrets.get("UPI_ID", os.getenv("UPI_ID", "madhu@@ybl"))
 
 DB_NAME = "hotel_streamlit.db"
 
