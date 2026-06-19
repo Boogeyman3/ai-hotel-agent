@@ -615,6 +615,52 @@ If value is missing, use null.
     )
 
     return extract_json_from_text(response.choices[0].message.content)
+def smart_booking_parser(user_text, current_data):
+    if not GROQ_API_KEY:
+        return {}
+
+    client = Groq(api_key=GROQ_API_KEY)
+
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+
+    prompt = f"""
+You are a smart NLP parser for hotel booking.
+
+User may type with spelling mistakes, grammar mistakes, mixed words, or incomplete text.
+
+Today: {today}
+Tomorrow: {tomorrow}
+
+Extract booking details and return ONLY valid JSON.
+
+Current data:
+{json.dumps(current_data)}
+
+Required keys:
+guest_name, email, phone, room_type, check_in, check_out, guests
+
+Rules:
+- Convert dates to YYYY-MM-DD.
+- Understand words like today, tomorrow, day after tomorrow.
+- Understand spelling mistakes like singel=single, delux=deluxe.
+- If user gives email, save email.
+- If user gives 10 digit number, save phone.
+- If user gives room type, match closest room type.
+- If missing, use null.
+- Do not write explanation.
+"""
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_text}
+        ],
+        temperature=0
+    )
+
+    return extract_json_from_text(response.choices[0].message.content)
 
 
 def update_dict(old, new):
@@ -785,6 +831,30 @@ if page == "🏠 Home":
 # ---------------- AI ASSISTANT ----------------
 elif page == "💬 AI Hotel Assistant":
     st.header("💬 AI Hotel Agent")
+    if st.button("🔄 Clear Chat / Start New Chat"):
+        st.session_state.messages = []
+        st.session_state.booking_data = {
+            "guest_name": None,
+            "email": None,
+            "phone": None,
+            "room_type": None,
+            "check_in": None,
+            "check_out": None,
+            "guests": None
+        }
+        st.session_state.food_data = {
+            "guest_name": None,
+            "room_number": None,
+            "food_item": None,
+            "quantity": None
+        }
+        st.session_state.service_data = {
+            "guest_name": None,
+            "room_number": None,
+            "service_type": None,
+            "message": None
+        }
+        st.rerun()
 
     st.info("Use Enter to send. You can speak using the microphone. I can book rooms, order food, request services, recommend rooms and answer questions.")
 
@@ -904,11 +974,6 @@ analyze review, excellent room and good service
             else:
                 intent = detect_action(user_question)
 
-
-
-
-
-
             if uploaded_file is not None and file_content == "IMAGE_UPLOADED":
                 response_text = analyze_image_with_groq(uploaded_file, user_question)
                 stream_and_speak(response_text)
@@ -1010,13 +1075,24 @@ analyze review, excellent room and good service
                         booking[missing[0]] = user_question
 
                     st.session_state.booking_data = booking
+                if "," in user_question:
+                    parts = [x.strip() for x in user_question.split(",")]
 
-                extracted = extract_details_with_groq(
+                    if len(parts) >= 7:
+                        st.session_state.booking_data = {
+                            "guest_name": parts[0],
+                            "email": parts[1],
+                            "phone": parts[2],
+                            "room_type": parts[3],
+                            "check_in": parts[4],
+                            "check_out": parts[5],
+                            "guests": parts[6]
+                        }
+
+                extracted = smart_booking_parser(
                     user_question,
-                    "booking",
                     st.session_state.booking_data
                 )
-
                 st.session_state.booking_data = update_dict(
                     st.session_state.booking_data,
                     extracted
