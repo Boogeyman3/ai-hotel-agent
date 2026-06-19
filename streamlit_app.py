@@ -168,7 +168,7 @@ room_model, sentiment_model, chatbot_model = load_models()
 
 def safe_image(path, caption=None):
     if os.path.exists(path):
-        st.image(path, caption=caption, use_container_width=True)
+        st.image(path, caption=caption, width="stretch")
     else:
         st.warning(f"Image missing: {path}")
 
@@ -252,11 +252,25 @@ def closest_room_type(text):
 
 
 def recommend_room_from_chat(budget, guests, stay_days):
-    return room_model.predict([[budget, guests, stay_days]])[0]
 
+    if room_model is None:
+        return "Room recommendation model not found."
+
+    input_df = pd.DataFrame(
+        [[budget, guests, stay_days]],
+        columns=["budget", "guests", "stay_days"]
+    )
+
+    return room_model.predict(input_df)[0]
 
 def analyze_review_from_chat(review_text):
+
+    if sentiment_model is None:
+        return "Sentiment model not found."
+
     result = sentiment_model.predict([review_text])[0]
+
+
 
     conn = get_connection()
     conn.execute(
@@ -408,11 +422,11 @@ def create_service_request(guest_name, room_number, service_type, message):
 
 
 def create_upi_qr(amount):
-    upi_id = "yourmadhu@ybl"
+    UPI_ID = os.getenv("UPI_ID", "yourmadhu@ybl")
     name = "NM Hotels"
 
     upi_link = (
-        f"upi://pay?pa={upi_id}"
+        f"upi://pay?pa={UPI_ID}"
         f"&pn={quote(name)}"
         f"&am={amount}"
         f"&cu=INR"
@@ -846,7 +860,7 @@ analyze review, excellent room and good service
                 st.write(file_content[:500])
 
         elif uploaded_file.type in ["image/jpeg", "image/png"]:
-            st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+            st.image(uploaded_file, caption="Uploaded Image", width="stretch")
             file_content = "IMAGE_UPLOADED"
 
     for msg in st.session_state.messages:
@@ -877,25 +891,22 @@ analyze review, excellent room and good service
             response_text = ""
             command = user_question.lower()
 
-            with st.chat_message("assistant"):
-                response_text = ""
-                command = user_question.lower()
+            if any(v is not None for v in st.session_state.booking_data.values()):
+                intent = "BOOK_ROOM"
 
-                if any(v is not None for v in st.session_state.booking_data.values()):
-                    intent = "BOOK_ROOM"
+            elif any(v is not None for v in st.session_state.food_data.values()):
+                intent = "FOOD_ORDER"
 
-                elif any(v is not None for v in st.session_state.food_data.values()):
-                    intent = "FOOD_ORDER"
+            elif any(v is not None for v in st.session_state.service_data.values()):
+                intent = "ROOM_SERVICE"
 
-                elif any(v is not None for v in st.session_state.service_data.values()):
-                    intent = "ROOM_SERVICE"
+            else:
+                intent = detect_action(user_question)
 
-                else:
-                    intent = detect_action(user_question)
 
-                if uploaded_file is not None and file_content == "IMAGE_UPLOADED":
-                    response_text = analyze_image_with_groq(uploaded_file, user_question)
-                    stream_and_speak(response_text)
+
+
+
 
             if uploaded_file is not None and file_content == "IMAGE_UPLOADED":
                 response_text = analyze_image_with_groq(uploaded_file, user_question)
@@ -903,7 +914,7 @@ analyze review, excellent room and good service
 
             elif "show" in command and "room" in command:
                 rooms_df = show_rooms()
-                st.dataframe(rooms_df, use_container_width=True)
+                st.dataframe(rooms_df, width="stretch")
                 response_text = "Here are the available rooms."
                 stream_and_speak(response_text)
 
@@ -992,9 +1003,8 @@ analyze review, excellent room and good service
                     elif user_question.isdigit():
                         booking["phone"] = user_question
 
-                    elif "-" in user_question and len(user_question) >= 10:
+                    elif re.match(r"^\d{4}-\d{2}-\d{2}$", user_question):
                         booking["check_out"] = user_question
-
                     else:
                         booking[missing[0]] = user_question
 
@@ -1010,6 +1020,28 @@ analyze review, excellent room and good service
                     st.session_state.booking_data,
                     extracted
                 )
+                booking = st.session_state.booking_data
+
+                bad_name_phrases = [
+                    "i need",
+                    "book",
+                    "booking",
+                    "room",
+                    "deluxe",
+                    "suite",
+                    "standard",
+                    "guest",
+                    "tomorrow"
+                ]
+
+                if booking.get("guest_name"):
+
+                    name = str(booking["guest_name"]).lower()
+
+                    if any(word in name for word in bad_name_phrases):
+                        booking["guest_name"] = None
+
+                st.session_state.booking_data = booking
 
                 missing = missing_fields(st.session_state.booking_data)
 
