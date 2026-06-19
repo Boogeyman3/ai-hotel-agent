@@ -4,6 +4,7 @@ import json
 import base64
 import sqlite3
 import tempfile
+import random
 from datetime import date, timedelta
 from urllib.parse import quote
 
@@ -12,7 +13,6 @@ import pandas as pd
 import qrcode
 import streamlit as st
 import yagmail
-from gtts import gTTS
 from dotenv import load_dotenv
 from groq import Groq
 from streamlit_mic_recorder import mic_recorder
@@ -23,23 +23,44 @@ except Exception:
     PdfReader = None
 
 
+# ---------------- PAGE CONFIG ----------------
 st.set_page_config(page_title="AI Hotel Agent", page_icon="🏨", layout="wide")
 load_dotenv()
 
+
+# ---------------- SECRETS / ENV ----------------
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
 GROQ_MODEL = st.secrets.get("GROQ_MODEL", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
-GROQ_VISION_MODEL = st.secrets.get("GROQ_VISION_MODEL", os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"))
+GROQ_VISION_MODEL = st.secrets.get(
+    "GROQ_VISION_MODEL",
+    os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+)
 GROQ_STT_MODEL = st.secrets.get("GROQ_STT_MODEL", os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo"))
 
 EMAIL_USER = st.secrets.get("EMAIL_USER", os.getenv("EMAIL_USER"))
 EMAIL_APP_PASSWORD = st.secrets.get("EMAIL_APP_PASSWORD", os.getenv("EMAIL_APP_PASSWORD"))
-UPI_ID = st.secrets.get("UPI_ID", os.getenv("UPI_ID", "madhu@@ybl"))
+UPI_ID = st.secrets.get("UPI_ID", os.getenv("UPI_ID", "yourupi@ybl"))
 
 DB_NAME = "hotel_streamlit.db"
 
 
+# ---------------- DATABASE ----------------
 def get_connection():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
+
+
+def ensure_column(table_name, column_name, column_type):
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in c.fetchall()]
+
+    if column_name not in columns:
+        c.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+    conn.commit()
+    conn.close()
 
 
 def create_tables():
@@ -112,6 +133,14 @@ def create_tables():
     conn.commit()
     conn.close()
 
+    # For old database files already created before new columns
+    ensure_column("bookings", "customer_id", "TEXT")
+    ensure_column("bookings", "booking_id", "TEXT")
+    ensure_column("bookings", "room_number", "TEXT")
+    ensure_column("bookings", "payment_status", "TEXT DEFAULT 'Pending'")
+    ensure_column("bookings", "transaction_id", "TEXT")
+
+
 def insert_default_rooms():
     conn = get_connection()
     c = conn.cursor()
@@ -145,12 +174,18 @@ def insert_default_rooms():
 
 
 create_tables()
-def generate_customer_id():
-    return f"CUST{1000 + len(st.session_state.messages)}"
+insert_default_rooms()
+
+
+# ---------------- ID HELPERS ----------------
+def generate_customer_id(phone=None):
+    if phone and str(phone).isdigit() and len(str(phone)) >= 4:
+        return "CUST" + str(phone)[-4:]
+
+    return f"CUST{random.randint(1000, 9999)}"
 
 
 def generate_booking_id():
-    import random
     return f"BK{random.randint(100000, 999999)}"
 
 
@@ -173,13 +208,14 @@ def allocate_room_number(room_type):
     }
 
     return rooms.get(room_type, "999")
-insert_default_rooms()
 
 
+# ---------------- LOAD MODELS ----------------
 @st.cache_resource
 def load_models():
     room_model = None
     sentiment_model = None
+    chatbot_model = None
 
     if os.path.exists("room_recommendation_model.pkl"):
         room_model = joblib.load("room_recommendation_model.pkl")
@@ -187,7 +223,6 @@ def load_models():
     if os.path.exists("sentiment_model.pkl"):
         sentiment_model = joblib.load("sentiment_model.pkl")
 
-    chatbot_model = None
     if os.path.exists("chatbot_intent_model.pkl"):
         chatbot_model = joblib.load("chatbot_intent_model.pkl")
 
@@ -197,62 +232,47 @@ def load_models():
 room_model, sentiment_model, chatbot_model = load_models()
 
 
+# ---------------- IMAGE / ROOM HELPERS ----------------
 def safe_image(path, caption=None):
     if os.path.exists(path):
         st.image(path, caption=caption, width="stretch")
     else:
         st.warning(f"Image missing: {path}")
 
+
 def get_room_image(room_type):
     room_type = room_type.lower()
 
     if "standard single" in room_type:
         return "assets/standard_single.jpg"
-
     elif "standard double" in room_type:
         return "assets/standard.jpg"
-
     elif "deluxe single" in room_type:
         return "assets/deluxe_single.jpg"
-
     elif "deluxe double" in room_type:
         return "assets/deluxe.jpg"
-
-    elif "suite single" in room_type:
-        return "assets/suite_single.jpg"
-
-    elif "suite double" in room_type:
-        return "assets/suite.jpg"
-
     elif "executive" in room_type:
         return "assets/deluxe.jpg"
-
     elif "business" in room_type:
         return "assets/deluxe.jpg"
-
     elif "family" in room_type:
         return "assets/suite.jpg"
-
     elif "garden" in room_type:
         return "assets/suite.jpg"
-
     elif "ocean" in room_type:
         return "assets/suite.jpg"
-
     elif "honeymoon" in room_type:
         return "assets/suite.jpg"
-
     elif "presidential" in room_type:
         return "assets/suite.jpg"
-
     elif "penthouse" in room_type:
         return "assets/suite.jpg"
-
     elif "suite" in room_type:
         return "assets/suite.jpg"
-
     else:
         return "assets/standard.jpg"
+
+
 def show_rooms():
     conn = get_connection()
     df = pd.read_sql_query("SELECT room_type, price FROM rooms", conn)
@@ -262,28 +282,62 @@ def show_rooms():
 
 def closest_room_type(text):
     rooms = show_rooms()["room_type"].tolist()
-    text = str(text).lower()
+    text = str(text).lower().strip()
 
     for room in rooms:
         if room.lower() == text:
             return room
 
-    if "deluxe " in text:
+    if "standard single" in text or "single standard" in text or "stand sing" in text:
+        return "Standard Single"
+    if "standard double" in text:
+        return "Standard Double"
+    if "deluxe single" in text:
+        return "Deluxe Single"
+    if "deluxe double" in text or "delux double" in text:
+        return "Deluxe Double"
+    if "deluxe" in text or "delux" in text:
         return "Deluxe Double"
     if "standard" in text:
-        return "Standard Double"
+        return "Standard Single"
     if "suite" in text:
         return "Suite Room"
     if "family" in text:
         return "Family Room"
     if "business" in text:
         return "Business Room"
+    if "executive" in text:
+        return "Executive Room"
 
     return None
 
 
-def recommend_room_from_chat(budget, guests, stay_days):
+# ---------------- DATE HELPERS ----------------
+def normalize_date(value):
+    if value in [None, "", "null", "None"]:
+        return None
 
+    text = str(value).strip().lower()
+
+    today = date.today()
+    if text in ["today"]:
+        return today.strftime("%Y-%m-%d")
+    if text in ["tomorrow", "tommorow", "tomorror"]:
+        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    if text in ["day after tomorrow", "dayafter tomorrow", "dayafter tomorror"]:
+        return (today + timedelta(days=2)).strftime("%Y-%m-%d")
+
+    try:
+        parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+        if pd.isna(parsed):
+            return value
+        return parsed.strftime("%Y-%m-%d")
+    except Exception:
+        return value
+
+
+# ---------------- ML FEATURES ----------------
+def recommend_room_from_chat(budget, guests, stay_days):
     if room_model is None:
         return "Room recommendation model not found."
 
@@ -294,14 +348,12 @@ def recommend_room_from_chat(budget, guests, stay_days):
 
     return room_model.predict(input_df)[0]
 
-def analyze_review_from_chat(review_text):
 
+def analyze_review_from_chat(review_text):
     if sentiment_model is None:
         return "Sentiment model not found."
 
     result = sentiment_model.predict([review_text])[0]
-
-
 
     conn = get_connection()
     conn.execute(
@@ -314,7 +366,121 @@ def analyze_review_from_chat(review_text):
     return result
 
 
-def send_booking_email(to_email, guest_name, room_type, check_in, check_out, total_price):
+# ---------------- PAYMENT ----------------
+def create_upi_qr(amount):
+    name = "NM Hotels"
+
+    upi_link = (
+        f"upi://pay?pa={UPI_ID}"
+        f"&pn={quote(name)}"
+        f"&am={amount}"
+        f"&cu=INR"
+    )
+
+    qr_img = qrcode.make(upi_link)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    qr_img.save(temp_file.name)
+    return temp_file.name
+
+
+def calculate_payment_breakdown(room_type, check_in, check_out):
+    room_type = closest_room_type(room_type)
+
+    if not room_type:
+        return None
+
+    conn = get_connection()
+    c = conn.cursor()
+
+    room = c.execute(
+        "SELECT price FROM rooms WHERE room_type = ?",
+        (room_type,)
+    ).fetchone()
+
+    conn.close()
+
+    if room is None:
+        return None
+
+    try:
+        nights = (pd.to_datetime(check_out) - pd.to_datetime(check_in)).days
+    except Exception:
+        return None
+
+    if nights <= 0:
+        return None
+
+    room_price = float(room[0])
+    subtotal = room_price * nights
+    gst = subtotal * 0.12
+    service_charge = subtotal * 0.05
+    total = subtotal + gst + service_charge
+
+    return {
+        "room_type": room_type,
+        "room_price": room_price,
+        "nights": nights,
+        "subtotal": round(subtotal, 2),
+        "gst": round(gst, 2),
+        "service_charge": round(service_charge, 2),
+        "total": round(total, 2)
+    }
+
+
+def show_payment_breakdown_and_qr(booking):
+    breakdown = calculate_payment_breakdown(
+        booking["room_type"],
+        booking["check_in"],
+        booking["check_out"]
+    )
+
+    if not breakdown:
+        st.error("Payment breakdown could not be calculated.")
+        return
+
+    st.subheader("💳 Payment Breakdown")
+    st.write(f"Booking ID: {booking.get('booking_id')}")
+    st.write(f"Customer ID: {booking.get('customer_id')}")
+    st.write(f"Room Number: {booking.get('room_number')}")
+    st.write(f"Room Type: {breakdown['room_type']}")
+    st.write(f"Room Price: ₹{breakdown['room_price']} per night")
+    st.write(f"Nights: {breakdown['nights']}")
+    st.write(f"Subtotal: ₹{breakdown['subtotal']}")
+    st.write(f"GST 12%: ₹{breakdown['gst']}")
+    st.write(f"Service Charge 5%: ₹{breakdown['service_charge']}")
+    st.success(f"Total Amount: ₹{breakdown['total']}")
+
+    qr_path = create_upi_qr(breakdown["total"])
+    st.image(qr_path, caption="Scan to Pay", width=250)
+
+
+def mark_payment_paid(transaction_id):
+    booking = st.session_state.current_booking
+
+    if not booking or not booking.get("booking_id"):
+        return "No active booking found."
+
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("""
+        UPDATE bookings
+        SET payment_status = 'Paid',
+            transaction_id = ?
+        WHERE booking_id = ?
+    """, (transaction_id, booking["booking_id"]))
+
+    conn.commit()
+    conn.close()
+
+    st.session_state.current_booking["payment_status"] = "Paid"
+    st.session_state.awaiting_payment = False
+
+    return f"Payment confirmed. Transaction ID: {transaction_id}"
+
+
+# ---------------- EMAIL ----------------
+def send_booking_email(to_email, guest_name, room_type, check_in, check_out, total_price, booking_id=None, customer_id=None, room_number=None):
     if not EMAIL_USER or not EMAIL_APP_PASSWORD:
         return False
 
@@ -323,12 +489,16 @@ Dear {guest_name},
 
 Your room booking is confirmed.
 
+Booking ID: {booking_id}
+Customer ID: {customer_id}
+Room Number: {room_number}
+
 Room Type: {room_type}
 Check-in Date: {check_in}
 Check-out Date: {check_out}
 Total Amount: ₹{total_price}
 
-Thank you for choosing your hotel.
+Thank you for choosing our hotel.
 
 Regards,
 Hotel Team
@@ -347,12 +517,15 @@ Hotel Team
         return False
 
 
+# ---------------- BOOKING / FOOD / SERVICE ----------------
 def book_room_from_chat(guest_name, email, phone, room_type, check_in, check_out, guests):
     if not guest_name or not email or not phone:
         return "Missing guest name, email, or phone."
 
     if "@" not in email:
         return "Invalid email address."
+
+    phone = re.sub(r"\D", "", str(phone))
 
     if not phone.isdigit() or len(phone) < 10:
         return "Invalid phone number."
@@ -362,27 +535,19 @@ def book_room_from_chat(guest_name, email, phone, room_type, check_in, check_out
     if not room_type:
         return "Room type not found. Type `show rooms` to see room names."
 
-    conn = get_connection()
-    c = conn.cursor()
-
-    room = c.execute(
-        "SELECT price FROM rooms WHERE room_type = ?",
-        (room_type,)
-    ).fetchone()
-
-    if room is None:
-        conn.close()
-        return "Room type not found."
+    check_in = normalize_date(check_in)
+    check_out = normalize_date(check_out)
 
     try:
         days = (pd.to_datetime(check_out) - pd.to_datetime(check_in)).days
     except Exception:
-        conn.close()
         return "Invalid date format. Use YYYY-MM-DD."
 
     if days <= 0:
-        conn.close()
         return "Check-out date must be after check-in date."
+
+    conn = get_connection()
+    c = conn.cursor()
 
     existing_booking = c.execute("""
         SELECT COUNT(*)
@@ -398,26 +563,84 @@ def book_room_from_chat(guest_name, email, phone, room_type, check_in, check_out
         conn.close()
         return "This room is already booked for selected dates."
 
-    total_price = room[0] * days
+    breakdown = calculate_payment_breakdown(room_type, check_in, check_out)
+
+    if not breakdown:
+        conn.close()
+        return "Payment breakdown could not be calculated."
+
+    total_price = breakdown["total"]
+
+    profile = st.session_state.customer_profile
+
+    customer_id = profile.get("customer_id") or generate_customer_id(phone)
+    booking_id = generate_booking_id()
+    room_number = allocate_room_number(room_type)
 
     c.execute("""
         INSERT INTO bookings
-        (guest_name, email, phone, room_type, check_in, check_out, guests, total_price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (customer_id, booking_id, room_number, guest_name, email, phone, room_type, check_in, check_out, guests, total_price, payment_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
+        customer_id, booking_id, room_number,
         guest_name, email, phone, room_type,
-        check_in, check_out, guests, total_price
+        check_in, check_out, guests, total_price, "Pending"
     ))
 
     conn.commit()
     conn.close()
 
+    st.session_state.customer_profile = {
+        "customer_id": customer_id,
+        "guest_name": guest_name,
+        "email": email,
+        "phone": phone,
+        "room_number": room_number,
+        "check_out": check_out
+    }
+
+    st.session_state.current_booking = {
+        "customer_id": customer_id,
+        "booking_id": booking_id,
+        "room_number": room_number,
+        "guest_name": guest_name,
+        "email": email,
+        "phone": phone,
+        "room_type": room_type,
+        "check_in": check_in,
+        "check_out": check_out,
+        "guests": guests,
+        "total_price": total_price,
+        "payment_status": "Pending"
+    }
+
     email_sent = send_booking_email(
-        email, guest_name, room_type, check_in, check_out, total_price
+        email, guest_name, room_type, check_in, check_out,
+        total_price, booking_id, customer_id, room_number
     )
 
-    status = "Confirmation email sent." if email_sent else "Email not sent."
-    return f"Room booked successfully. Room: {room_type}, Total Amount: ₹{total_price}. {status}"
+    email_status = "Confirmation email sent." if email_sent else "Email not sent."
+
+    return f"""
+✅ Room booked successfully.
+
+Booking ID: {booking_id}
+Customer ID: {customer_id}
+Room Number: {room_number}
+
+Guest Name: {guest_name}
+Room Type: {room_type}
+Check-in: {check_in}
+Check-out: {check_out}
+Guests: {guests}
+
+Total Amount: ₹{total_price}
+Payment Status: Pending
+
+{email_status}
+
+Type `pay now` to generate UPI QR code.
+"""
 
 
 def place_food_order(guest_name, room_number, food_item, quantity):
@@ -452,23 +675,7 @@ def create_service_request(guest_name, room_number, service_type, message):
     return f"Room service request created for room {room_number}: {service_type}."
 
 
-def create_upi_qr(amount):
-    UPI_ID = os.getenv("UPI_ID", "yourmadhu@ybl")
-    name = "NM Hotels"
-
-    upi_link = (
-        f"upi://pay?pa={UPI_ID}"
-        f"&pn={quote(name)}"
-        f"&am={amount}"
-        f"&cu=INR"
-    )
-
-    qr_img = qrcode.make(upi_link)
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    qr_img.save(temp_file.name)
-    return temp_file.name
-
-
+# ---------------- GROQ / FILE / VOICE ----------------
 def analyze_image_with_groq(uploaded_file, user_question):
     if not GROQ_API_KEY:
         return "Groq API Key not found."
@@ -518,6 +725,9 @@ def extract_pdf_text(uploaded_file):
 
 
 def convert_voice_to_text(audio):
+    if not GROQ_API_KEY:
+        return "Voice-to-text error: Groq API key missing."
+
     try:
         audio_bytes = audio["bytes"]
 
@@ -539,55 +749,9 @@ def convert_voice_to_text(audio):
         return f"Voice-to-text error: {e}"
 
 
-def speak_response(text):
-    try:
-        tts = gTTS(text)
-        temp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tts.save(temp_mp3.name)
-        return temp_mp3.name
-    except Exception:
-        return None
-
-
-def detect_action(user_text):
-    text = user_text.lower()
-
-    if (
-        any(word in text for word in [
-            "book", "booking", "reserve", "reservation",
-            "need a room", "want a room", "deluxe room",
-            "standard room", "suite room", "room for"
-        ])
-    ):
-        return "BOOK_ROOM"
-
-    if "food" in text or "biryani" in text or "order" in text:
-        return "FOOD_ORDER"
-
-    if "service" in text or "cleaning" in text or "towel" in text:
-        return "ROOM_SERVICE"
-
-    if "recommend" in text:
-        return "ROOM_RECOMMEND"
-
-    if "review" in text:
-        return "REVIEW"
-
-    if chatbot_model:
-        try:
-            return chatbot_model.predict([user_text])[0]
-        except Exception:
-            pass
-
-    return "CHAT"
-
-
 def stream_and_speak(response_text):
-    st.write_stream(word + " " for word in response_text.split())
-
-    audio_file = speak_response(response_text)
-    if audio_file:
-        st.audio(audio_file)
+    # Audio disabled for Streamlit Cloud stability
+    st.write(response_text)
 
 
 def extract_json_from_text(text):
@@ -645,6 +809,8 @@ If value is missing, use null.
     )
 
     return extract_json_from_text(response.choices[0].message.content)
+
+
 def smart_booking_parser(user_text, current_data):
     if not GROQ_API_KEY:
         return {}
@@ -672,12 +838,13 @@ guest_name, email, phone, room_type, check_in, check_out, guests
 
 Rules:
 - Convert dates to YYYY-MM-DD.
-- Understand words like today, tomorrow, day after tomorrow.
+- Understand today, tomorrow, day after tomorrow.
 - Understand spelling mistakes like singel=single, delux=deluxe.
 - If user gives email, save email.
 - If user gives 10 digit number, save phone.
-- If user gives room type, match closest room type.
-- If missing, use null.
+- If user gives room type, match closest hotel room type.
+- If user says only booking request, do not use that as guest name.
+- If value is missing, use null.
 - Do not write explanation.
 """
 
@@ -693,15 +860,101 @@ Rules:
     return extract_json_from_text(response.choices[0].message.content)
 
 
+# ---------------- DATA HELPERS ----------------
 def update_dict(old, new):
     for key, value in new.items():
         if value not in [None, "", "null", "None"]:
-            old[key] = value
+            if key in ["check_in", "check_out"]:
+                old[key] = normalize_date(value)
+            else:
+                old[key] = value
     return old
 
 
 def missing_fields(data):
     return [k for k, v in data.items() if v in [None, "", "null", "None"]]
+
+
+def update_customer_profile(data):
+    profile = st.session_state.customer_profile
+
+    for key in ["guest_name", "email", "phone", "room_number", "check_out"]:
+        if key in data and data[key] not in [None, "", "null", "None"]:
+            profile[key] = data[key]
+
+    if not profile.get("customer_id") and profile.get("phone"):
+        profile["customer_id"] = generate_customer_id(profile["phone"])
+
+    st.session_state.customer_profile = profile
+
+
+def apply_customer_profile(data):
+    profile = st.session_state.customer_profile
+
+    for key in ["guest_name", "email", "phone", "room_number"]:
+        if key in data and data[key] in [None, "", "null", "None"]:
+            data[key] = profile.get(key)
+
+    return data
+
+
+def is_likely_name(text):
+    text = text.strip().lower()
+
+    bad_words = [
+        "book", "booking", "room", "want", "need", "yes",
+        "payment", "pay", "standard", "deluxe", "suite",
+        "food", "service", "confirm", "proceed"
+    ]
+
+    if any(word in text for word in bad_words):
+        return False
+
+    if "@" in text:
+        return False
+
+    if re.search(r"\d", text):
+        return False
+
+    return 1 <= len(text.split()) <= 3 and len(text) > 1
+
+
+# ---------------- INTENT ----------------
+def detect_action(user_text):
+    text = user_text.lower()
+
+    if any(word in text for word in ["pay", "payment", "upi", "transaction"]):
+        return "PAYMENT"
+
+    if any(word in text for word in ["checkout", "check out", "clear customer", "end stay"]):
+        return "CHECKOUT"
+
+    if any(word in text for word in [
+        "book", "booking", "reserve", "reservation",
+        "need a room", "want a room", "deluxe room",
+        "standard room", "suite room", "room for"
+    ]):
+        return "BOOK_ROOM"
+
+    if "food" in text or "biryani" in text or "order" in text:
+        return "FOOD_ORDER"
+
+    if "service" in text or "cleaning" in text or "towel" in text:
+        return "ROOM_SERVICE"
+
+    if "recommend" in text:
+        return "ROOM_RECOMMEND"
+
+    if "review" in text:
+        return "REVIEW"
+
+    if chatbot_model:
+        try:
+            return chatbot_model.predict([user_text])[0]
+        except Exception:
+            pass
+
+    return "CHAT"
 
 
 # ---------------- CSS ----------------
@@ -752,56 +1005,13 @@ section[data-testid="stSidebar"] * {
 }
 </style>
 """, unsafe_allow_html=True)
-def update_customer_profile(data):
-    profile = st.session_state.customer_profile
-
-    mapping = {
-        "guest_name": "guest_name",
-        "email": "email",
-        "phone": "phone",
-        "room_number": "room_number",
-        "check_out": "check_out"
-    }
-
-    for source_key, profile_key in mapping.items():
-        if source_key in data and data[source_key] not in [None, "", "null", "None"]:
-            profile[profile_key] = data[source_key]
-
-    if not profile.get("customer_id") and profile.get("phone"):
-        profile["customer_id"] = "CUST" + profile["phone"][-4:]
-
-    st.session_state.customer_profile = profile
 
 
-def apply_customer_profile(data):
-    profile = st.session_state.customer_profile
-
-    for key in ["guest_name", "email", "phone"]:
-        if key in data and data[key] in [None, "", "null", "None"]:
-            data[key] = profile.get(key)
-
-    return data
-
-
-st.markdown('<div class="main-title">🤖 AI Hotel Agent</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="sub-title">Book Rooms • Order Food • Request Services • Analyze Reviews • Voice AI Support</div>',
-    unsafe_allow_html=True
-)
-
-st.sidebar.title("Navigation")
-page = st.sidebar.radio(
-    "Go to",
-    ["🏠 Home", "💬 AI Hotel Assistant", "🖼 Hotel Gallery"]
-)
-
-
+# ---------------- SESSION STATE ----------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "customer_profile" not in st.session_state:
-    if "awaiting_payment" not in st.session_state:
-        st.session_state.awaiting_payment = False
     st.session_state.customer_profile = {
         "customer_id": None,
         "guest_name": None,
@@ -810,6 +1020,12 @@ if "customer_profile" not in st.session_state:
         "room_number": None,
         "check_out": None
     }
+
+if "current_booking" not in st.session_state:
+    st.session_state.current_booking = None
+
+if "awaiting_payment" not in st.session_state:
+    st.session_state.awaiting_payment = False
 
 if "booking_data" not in st.session_state:
     st.session_state.booking_data = {
@@ -821,8 +1037,6 @@ if "booking_data" not in st.session_state:
         "check_out": None,
         "guests": None
     }
-if "awaiting_payment" not in st.session_state:
-    st.session_state.awaiting_payment = False
 
 if "food_data" not in st.session_state:
     st.session_state.food_data = {
@@ -842,6 +1056,32 @@ if "service_data" not in st.session_state:
 
 if "voice_question" not in st.session_state:
     st.session_state.voice_question = ""
+
+
+# ---------------- HEADER ----------------
+st.markdown('<div class="main-title">🤖 AI Hotel Agent</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-title">Book Rooms • Order Food • Request Services • Analyze Reviews • Voice AI Support</div>',
+    unsafe_allow_html=True
+)
+
+st.sidebar.title("Navigation")
+page = st.sidebar.radio(
+    "Go to",
+    ["🏠 Home", "💬 AI Hotel Assistant", "🖼 Hotel Gallery"]
+)
+
+
+# ---------------- SIDEBAR PROFILE ----------------
+profile = st.session_state.customer_profile
+if profile.get("guest_name"):
+    st.sidebar.subheader("👤 Current Customer")
+    st.sidebar.write(f"Customer ID: {profile.get('customer_id')}")
+    st.sidebar.write(f"Name: {profile.get('guest_name')}")
+    st.sidebar.write(f"Email: {profile.get('email')}")
+    st.sidebar.write(f"Phone: {profile.get('phone')}")
+    st.sidebar.write(f"Room: {profile.get('room_number')}")
+    st.sidebar.write(f"Checkout: {profile.get('check_out')}")
 
 
 # ---------------- HOME ----------------
@@ -904,32 +1144,51 @@ if page == "🏠 Home":
 # ---------------- AI ASSISTANT ----------------
 elif page == "💬 AI Hotel Assistant":
     st.header("💬 AI Hotel Agent")
-    if st.button("🔄 Clear Chat / Start New Chat"):
-        st.session_state.messages = []
-        st.session_state.booking_data = {
-            "guest_name": None,
-            "email": None,
-            "phone": None,
-            "room_type": None,
-            "check_in": None,
-            "check_out": None,
-            "guests": None
-        }
-        st.session_state.food_data = {
-            "guest_name": None,
-            "room_number": None,
-            "food_item": None,
-            "quantity": None
-        }
-        st.session_state.service_data = {
-            "guest_name": None,
-            "room_number": None,
-            "service_type": None,
-            "message": None
-        }
-        st.rerun()
 
-    st.info("Use Enter to send. You can speak using the microphone. I can book rooms, order food, request services, recommend rooms and answer questions.")
+    col_clear, col_checkout = st.columns(2)
+
+    with col_clear:
+        if st.button("🔄 Clear Chat / Start New Chat"):
+            st.session_state.messages = []
+            st.session_state.booking_data = {
+                "guest_name": None,
+                "email": None,
+                "phone": None,
+                "room_type": None,
+                "check_in": None,
+                "check_out": None,
+                "guests": None
+            }
+            st.session_state.food_data = {
+                "guest_name": None,
+                "room_number": None,
+                "food_item": None,
+                "quantity": None
+            }
+            st.session_state.service_data = {
+                "guest_name": None,
+                "room_number": None,
+                "service_type": None,
+                "message": None
+            }
+            st.rerun()
+
+    with col_checkout:
+        if st.button("✅ Checkout / Clear Customer"):
+            st.session_state.customer_profile = {
+                "customer_id": None,
+                "guest_name": None,
+                "email": None,
+                "phone": None,
+                "room_number": None,
+                "check_out": None
+            }
+            st.session_state.current_booking = None
+            st.session_state.awaiting_payment = False
+            st.success("Customer checked out and details cleared.")
+            st.rerun()
+
+    st.info("Use Enter to send. I can book rooms, order food, request services, recommend rooms, analyze reviews, files and images.")
 
     c1, c2, c3 = st.columns(3)
 
@@ -939,11 +1198,11 @@ elif page == "💬 AI Hotel Assistant":
 
     with c2:
         if st.button("🍽 Order Food"):
-            st.session_state.chat_prompt = "Send 2 chicken biryanis to room 101"
+            st.session_state.chat_prompt = "Send 2 chicken biryanis to my room"
 
     with c3:
         if st.button("🛎 Room Service"):
-            st.session_state.chat_prompt = "Need room cleaning in room 101"
+            st.session_state.chat_prompt = "Need room cleaning"
 
     with st.expander("📌 Example Commands"):
         st.write("""
@@ -951,13 +1210,19 @@ show rooms
 
 recommend, 5000, 2, 3
 
-book room, Madhu, email@gmail.com, 9999999999, Deluxe Double, 2026-06-20, 2026-06-22, 2
+book room
 
-place food, Madhu, 101, Chicken Biryani, 2
+Madhu,maddalamadhuram3@gmail.com,8688087482,Standard Single,2026-06-20,2026-06-22,1
 
-service, Madhu, 101, Cleaning, Need room cleaning
+pay now
 
-analyze review, excellent room and good service
+paid TXN123456
+
+Send 2 chicken biryanis to my room
+
+Need room cleaning
+
+checkout
         """)
 
     audio = mic_recorder(
@@ -992,13 +1257,10 @@ analyze review, excellent room and good service
 
             if file_content.startswith("PDF library not installed"):
                 st.error(file_content)
-
             elif file_content.startswith("PDF extraction error"):
                 st.error(file_content)
-
             elif len(file_content.strip()) == 0:
                 st.error("PDF text is empty. Try another PDF.")
-
             else:
                 st.success("PDF text extracted successfully.")
                 st.write(file_content[:500])
@@ -1034,20 +1296,43 @@ analyze review, excellent room and good service
         with st.chat_message("assistant"):
             response_text = ""
             command = user_question.lower()
+            intent = detect_action(user_question)
 
-            if any(v is not None for v in st.session_state.booking_data.values()):
-                intent = "BOOK_ROOM"
+            # -------- PAYMENT HANDLER FIRST --------
+            if intent == "PAYMENT":
+                if st.session_state.current_booking:
+                    if "paid" in command or "txn" in command or "transaction" in command:
+                        transaction_id = user_question.replace("paid", "").strip()
+                        if not transaction_id:
+                            transaction_id = "TXN" + str(random.randint(100000, 999999))
 
-            elif any(v is not None for v in st.session_state.food_data.values()):
-                intent = "FOOD_ORDER"
+                        response_text = mark_payment_paid(transaction_id)
+                        stream_and_speak(response_text)
 
-            elif any(v is not None for v in st.session_state.service_data.values()):
-                intent = "ROOM_SERVICE"
+                    else:
+                        show_payment_breakdown_and_qr(st.session_state.current_booking)
+                        response_text = "Scan the UPI QR code and type `paid YOUR_TRANSACTION_ID` after payment."
+                        stream_and_speak(response_text)
 
-            else:
-                intent = detect_action(user_question)
+                else:
+                    response_text = "No active booking found for payment."
+                    stream_and_speak(response_text)
 
-            if uploaded_file is not None and file_content == "IMAGE_UPLOADED":
+            elif intent == "CHECKOUT":
+                st.session_state.customer_profile = {
+                    "customer_id": None,
+                    "guest_name": None,
+                    "email": None,
+                    "phone": None,
+                    "room_number": None,
+                    "check_out": None
+                }
+                st.session_state.current_booking = None
+                st.session_state.awaiting_payment = False
+                response_text = "Checkout completed. Customer details cleared."
+                stream_and_speak(response_text)
+
+            elif uploaded_file is not None and file_content == "IMAGE_UPLOADED":
                 response_text = analyze_image_with_groq(uploaded_file, user_question)
                 stream_and_speak(response_text)
 
@@ -1084,6 +1369,10 @@ analyze review, excellent room and good service
                         parts[6].strip(),
                         int(parts[7].strip())
                     )
+
+                    if "Room booked successfully" in response_text:
+                        show_payment_breakdown_and_qr(st.session_state.current_booking)
+
                 else:
                     response_text = "Use format: book room, Name, email, phone, Room Type, check_in, check_out, guests"
 
@@ -1124,30 +1413,10 @@ analyze review, excellent room and good service
                 result = analyze_review_from_chat(review_text)
                 response_text = f"Review Sentiment: {result}"
                 stream_and_speak(response_text)
-            elif intent == "BOOK_ROOM":
+
+            elif intent == "BOOK_ROOM" or any(v is not None for v in st.session_state.booking_data.values()):
 
                 booking = st.session_state.booking_data
-
-                missing = [
-                    k for k, v in booking.items()
-                    if v in [None, "", "null", "None"]
-                ]
-
-                if missing and "," not in user_question:
-
-                    if "@" in user_question:
-                        booking["email"] = user_question
-
-                    elif user_question.isdigit():
-                        booking["phone"] = user_question
-
-                    elif re.match(r"^\d{4}-\d{2}-\d{2}$", user_question):
-                        booking["check_out"] = user_question
-
-                    else:
-                        booking[missing[0]] = user_question
-
-                    st.session_state.booking_data = booking
 
                 if "," in user_question:
                     parts = [x.strip() for x in user_question.split(",")]
@@ -1156,107 +1425,103 @@ analyze review, excellent room and good service
                         st.session_state.booking_data = {
                             "guest_name": parts[0],
                             "email": parts[1],
-                            "phone": parts[2],
+                            "phone": re.sub(r"\D", "", parts[2]),
                             "room_type": parts[3],
-                            "check_in": parts[4],
-                            "check_out": parts[5],
+                            "check_in": normalize_date(parts[4]),
+                            "check_out": normalize_date(parts[5]),
                             "guests": parts[6]
                         }
 
-                extracted = smart_booking_parser(
-                    user_question,
-                    st.session_state.booking_data
-                )
+                else:
+                    missing = missing_fields(booking)
 
-                st.session_state.booking_data = update_dict(
-                    st.session_state.booking_data,
-                    extracted
-                )
+                    if missing:
+                        if "@" in user_question:
+                            booking["email"] = user_question.strip()
+
+                        elif re.search(r"\d{10}", user_question):
+                            booking["phone"] = re.search(r"\d{10}", user_question).group()
+
+                        elif re.match(r"^\d{4}-\d{2}-\d{2}$", user_question) or re.match(r"^\d{2}-\d{2}-\d{4}$", user_question):
+                            if not booking.get("check_in"):
+                                booking["check_in"] = normalize_date(user_question)
+                            else:
+                                booking["check_out"] = normalize_date(user_question)
+
+                        elif is_likely_name(user_question) and not booking.get("guest_name"):
+                            booking["guest_name"] = user_question.strip()
+
+                        st.session_state.booking_data = booking
+
+                    extracted = smart_booking_parser(
+                        user_question,
+                        st.session_state.booking_data
+                    )
+
+                    st.session_state.booking_data = update_dict(
+                        st.session_state.booking_data,
+                        extracted
+                    )
 
                 st.session_state.booking_data = apply_customer_profile(
                     st.session_state.booking_data
                 )
 
-                update_customer_profile(st.session_state.booking_data)
-
                 booking = st.session_state.booking_data
-
-                bad_name_phrases = [
-                    "i need",
-                    "book",
-                    "booking",
-                    "room",
-                    "deluxe",
-                    "suite",
-                    "standard",
-                    "guest",
-                    "tomorrow"
-                ]
 
                 if booking.get("guest_name"):
                     name = str(booking["guest_name"]).lower()
-
-                    if any(word in name for word in bad_name_phrases) or len(name.split()) > 3:
+                    bad_name_words = ["book", "booking", "room", "want", "need", "standard", "deluxe", "suite"]
+                    if any(word in name for word in bad_name_words) or len(name.split()) > 3:
                         booking["guest_name"] = None
 
-                st.session_state.booking_data = booking
+                update_customer_profile(booking)
 
-                missing = missing_fields(st.session_state.booking_data)
+                missing = missing_fields(booking)
 
                 if missing:
-
                     response_text = f"""
-            Current Booking Data:
+Current Booking Data:
 
-            Name: {st.session_state.booking_data['guest_name']}
-            Email: {st.session_state.booking_data['email']}
-            Phone: {st.session_state.booking_data['phone']}
-            Room Type: {st.session_state.booking_data['room_type']}
-            Check In: {st.session_state.booking_data['check_in']}
-            Check Out: {st.session_state.booking_data['check_out']}
-            Guests: {st.session_state.booking_data['guests']}
+Name: {booking['guest_name']}
+Email: {booking['email']}
+Phone: {booking['phone']}
+Room Type: {booking['room_type']}
+Check In: {booking['check_in']}
+Check Out: {booking['check_out']}
+Guests: {booking['guests']}
 
-            Please provide: {', '.join(missing)}
-            """
+Please provide: {', '.join(missing)}
+"""
+                    stream_and_speak(response_text)
 
                 else:
-
-                    data = st.session_state.booking_data
-
                     response_text = book_room_from_chat(
-                        data["guest_name"],
-                        data["email"],
-                        data["phone"],
-                        data["room_type"],
-                        data["check_in"],
-                        data["check_out"],
-                        int(data["guests"])
+                        booking["guest_name"],
+                        booking["email"],
+                        booking["phone"],
+                        booking["room_type"],
+                        booking["check_in"],
+                        booking["check_out"],
+                        int(booking["guests"])
                     )
 
                     if "Room booked successfully" in response_text:
-
                         st.session_state.awaiting_payment = True
+                        show_payment_breakdown_and_qr(st.session_state.current_booking)
 
-                        breakdown = calculate_payment_breakdown(
-                            data["room_type"],
-                            data["check_in"],
-                            data["check_out"]
-                        )
+                        # Reset only booking form; keep customer profile and current booking
+                        st.session_state.booking_data = {
+                            "guest_name": None,
+                            "email": None,
+                            "phone": None,
+                            "room_type": None,
+                            "check_in": None,
+                            "check_out": None,
+                            "guests": None
+                        }
 
-                        if breakdown:
-                            st.subheader("💳 Payment Breakdown")
-                            st.write(f"Room Type: {breakdown['room_type']}")
-                            st.write(f"Room Price: ₹{breakdown['room_price']} per night")
-                            st.write(f"Nights: {breakdown['nights']}")
-                            st.write(f"Subtotal: ₹{breakdown['subtotal']}")
-                            st.write(f"GST 12%: ₹{breakdown['gst']}")
-                            st.write(f"Service Charge 5%: ₹{breakdown['service_charge']}")
-                            st.success(f"Total Amount: ₹{breakdown['total']}")
-
-                            qr_path = create_upi_qr(breakdown["total"])
-                            st.image(qr_path, caption="Scan to Pay", width=250)
-
-                stream_and_speak(response_text)
+                    stream_and_speak(response_text)
 
             elif intent == "FOOD_ORDER":
                 extracted = extract_details_with_groq(
@@ -1268,6 +1533,10 @@ analyze review, excellent room and good service
                 st.session_state.food_data = update_dict(
                     st.session_state.food_data,
                     extracted
+                )
+
+                st.session_state.food_data = apply_customer_profile(
+                    st.session_state.food_data
                 )
 
                 missing = missing_fields(st.session_state.food_data)
@@ -1305,6 +1574,10 @@ analyze review, excellent room and good service
                     extracted
                 )
 
+                st.session_state.service_data = apply_customer_profile(
+                    st.session_state.service_data
+                )
+
                 missing = missing_fields(st.session_state.service_data)
 
                 if missing:
@@ -1329,44 +1602,53 @@ analyze review, excellent room and good service
                 stream_and_speak(response_text)
 
             elif file_content:
-                client = Groq(api_key=GROQ_API_KEY)
+                if not GROQ_API_KEY:
+                    response_text = "Groq API Key not found."
+                else:
+                    client = Groq(api_key=GROQ_API_KEY)
 
-                response = client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Analyze the uploaded file content and answer the user question."
-                        },
-                        {
-                            "role": "user",
-                            "content": f"{user_question}\n\nFile content:\n{file_content}"
-                        }
-                    ]
-                )
+                    response = client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "Analyze the uploaded file content and answer the user question."
+                            },
+                            {
+                                "role": "user",
+                                "content": f"{user_question}\n\nFile content:\n{file_content}"
+                            }
+                        ]
+                    )
 
-                response_text = response.choices[0].message.content
+                    response_text = response.choices[0].message.content
+
                 stream_and_speak(response_text)
 
             else:
-                client = Groq(api_key=GROQ_API_KEY)
+                if not GROQ_API_KEY:
+                    response_text = "Groq API Key not found."
+                else:
+                    client = Groq(api_key=GROQ_API_KEY)
 
-                response = client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": """
-                            You are an AI hotel agent.
-                            Help with room booking, food order, room service,
-                            payments, reviews, file analysis and support.
-                            """
-                        },
-                        {"role": "user", "content": user_question}
-                    ]
-                )
+                    response = client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": """
+You are an AI hotel agent.
+Answer briefly and helpfully.
+For booking/payment/food/service, do not invent booking confirmations.
+Let the Python system handle actual booking and payment.
+"""
+                            },
+                            {"role": "user", "content": user_question}
+                        ]
+                    )
 
-                response_text = response.choices[0].message.content
+                    response_text = response.choices[0].message.content
+
                 stream_and_speak(response_text)
 
         st.session_state.messages.append(
@@ -1374,6 +1656,7 @@ analyze review, excellent room and good service
         )
 
 
+# ---------------- GALLERY ----------------
 elif page == "🖼 Hotel Gallery":
 
     st.header("🏨 Hotel Gallery")
@@ -1400,9 +1683,7 @@ elif page == "🖼 Hotel Gallery":
     cols = st.columns(3)
 
     for index, room in rooms_df.iterrows():
-
         with cols[index % 3]:
-
             safe_image(
                 get_room_image(room["room_type"]),
                 room["room_type"]
