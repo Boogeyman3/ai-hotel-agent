@@ -22,7 +22,7 @@ try:
 except Exception:
     PdfReader = None
 
-
+APP_VERSION = "payment_customer_memory_v2"
 # ---------------- PAGE CONFIG ----------------
 st.set_page_config(page_title="AI Hotel Agent", page_icon="🏨", layout="wide")
 load_dotenv()
