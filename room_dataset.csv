@@ -1,0 +1,24 @@
+budget,guests,stay_days,room_type
+2000,1,1,Standard Single
+2500,1,2,Standard Single
+3000,2,1,Standard Double
+3500,2,2,Standard Double
+4000,1,1,Deluxe Single
+4500,2,2,Deluxe Double
+5000,2,3,Deluxe Double
+5500,2,1,Executive Room
+6000,2,2,Business Room
+6500,2,3,Business Room
+7000,2,2,Family Room
+8000,3,2,Family Room
+8500,3,3,Garden View Room
+9000,3,2,Garden View Room
+10000,3,3,Suite Room
+11000,3,3,Ocean View Room
+12000,2,2,Luxury Suite
+13000,2,3,Luxury Suite
+15000,2,2,Honeymoon Suite
+18000,4,3,Presidential Suite
+20000,4,2,Presidential Suite
+22000,4,3,Penthouse Suite
+25000,4,4,Penthouse Suite
