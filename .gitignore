@@ -2,6 +2,5 @@
 __pycache__/
 *.pyc
 .env
-.env
 hotel_streamlit.db
 __pycache__/
