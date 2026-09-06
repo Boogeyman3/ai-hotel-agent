@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import base64
 import sqlite3
@@ -42,8 +43,21 @@ GROQ_VISION_MODEL = get_secret("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17
 GROQ_STT_MODEL = get_secret("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 EMAIL_USER = get_secret("EMAIL_USER")
 EMAIL_APP_PASSWORD = get_secret("EMAIL_APP_PASSWORD")
-UPI_ID = get_secret("UPI_ID", "yourupi@ybl")
-STAFF_PASSWORD = get_secret("STAFF_PASSWORD", "1234")
+UPI_ID = get_secret("UPI_ID")
+STAFF_PASSWORD = get_secret("STAFF_PASSWORD")
+
+ML_INTENT_MAP = {
+    "booking": "BOOK_ROOM",
+    "room_availability": "BOOK_ROOM",
+    "payment": "PAYMENT",
+    "checkout": "CHECKOUT",
+    "checkin": "CHECKOUT",
+    "greeting": "CHAT",
+    "thanks": "CHAT",
+    "wifi": "CHAT",
+    "location": "CHAT",
+    "room_price": "CHAT",
+}
 
 
 # ---------------- DATABASE ----------------
@@ -329,10 +343,10 @@ def analyze_review_from_chat(review_text):
 # ---------------- PAYMENT ----------------
 def create_upi_qr(amount):
     name = "NM Hotels"
-    upi_id = str(UPI_ID).strip()
+    upi_id = str(UPI_ID or "").strip()
 
     if not upi_id or "@" not in upi_id or "@@" in upi_id or "UPI_ID=" in upi_id:
-        st.error("Invalid UPI ID. In .env use only: UPI_ID=yourrealupi@ybl")
+        st.error("UPI ID not configured. Set UPI_ID in .env or Streamlit secrets.")
         return None, None
 
     try:
@@ -350,9 +364,10 @@ def create_upi_qr(amount):
         f"&tn={quote('Hotel Room Booking')}"
     )
     qr_img = qrcode.make(upi_link)
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    qr_img.save(temp_file.name)
-    return temp_file.name, upi_link
+    buf = io.BytesIO()
+    qr_img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf, upi_link
 
 
 def calculate_payment_breakdown(room_type, check_in, check_out):
@@ -411,9 +426,9 @@ def show_payment_breakdown_and_qr(booking):
     st.write(f"Service Charge 5%: ₹{breakdown['service_charge']}")
     st.success(f"Total Amount: ₹{breakdown['total']}")
 
-    qr_path, upi_link = create_upi_qr(breakdown["total"])
-    if qr_path:
-        st.image(qr_path, caption="Scan to Pay", width=250)
+    qr_buf, upi_link = create_upi_qr(breakdown["total"])
+    if qr_buf:
+        st.image(qr_buf, caption="Scan to Pay", width=250)
         st.markdown(
             f"""
             <a href="{upi_link}">
@@ -489,7 +504,7 @@ def verify_payment_manually(booking_id):
 
 
 # ---------------- EMAIL ----------------
-def send_booking_email(to_email, guest_name, room_type, check_in, check_out, total_price, booking_id=None, customer_id=None, room_number=None):
+def send_booking_email(to_email, guest_name, room_type, check_in, check_out, total_price, booking_id=None, customer_id=None, room_number=None, payment_status="Pending"):
     if not EMAIL_USER or not EMAIL_APP_PASSWORD:
         return False
 
@@ -506,7 +521,7 @@ Room Type: {room_type}
 Check-in Date: {check_in}
 Check-out Date: {check_out}
 Total Amount: ₹{total_price}
-Payment Status: Pending
+Payment Status: {payment_status}
 
 Thank you for choosing our hotel.
 
@@ -622,7 +637,12 @@ def book_room_from_chat(guest_name, email, phone, room_type, check_in, check_out
         "payment_status": "Pending",
     }
 
-    email_sent = send_booking_email(email, guest_name, room_type, check_in, check_out, total_price, booking_id, customer_id, room_number)
+    st.session_state.awaiting_payment = True
+
+    email_sent = send_booking_email(
+        email, guest_name, room_type, check_in, check_out, total_price,
+        booking_id, customer_id, room_number, payment_status="Pending",
+    )
     email_status = "Confirmation email sent." if email_sent else "Email not sent."
 
     return f"""
@@ -714,17 +734,22 @@ def extract_pdf_text(uploaded_file):
 def convert_voice_to_text(audio):
     if not GROQ_API_KEY:
         return "Voice-to-text error: Groq API key missing."
+    temp_path = None
     try:
         audio_bytes = audio["bytes"]
         temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".webm")
         temp_audio.write(audio_bytes)
         temp_audio.close()
+        temp_path = temp_audio.name
         client = Groq(api_key=GROQ_API_KEY)
-        with open(temp_audio.name, "rb") as audio_file:
+        with open(temp_path, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(file=audio_file, model=GROQ_STT_MODEL)
         return transcription.text
     except Exception as e:
         return f"Voice-to-text error: {e}"
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def stream_and_speak(response_text):
@@ -840,19 +865,27 @@ def is_likely_name(text):
     return 1 <= len(text.split()) <= 3 and len(text) > 1
 
 
+def map_ml_intent(label):
+    return ML_INTENT_MAP.get(str(label).strip().lower(), "CHAT")
+
+
 def detect_action(user_text):
-    text = user_text.lower()
+    text = user_text.lower().strip()
+    if text in ["cancel", "cancel booking", "stop booking"]:
+        return "CANCEL_BOOKING"
     if text.startswith("verify payment"):
         return "PAYMENT"
-    if any(word in text for word in ["pay", "payment", "upi", "transaction"]):
+    if any(phrase in text for phrase in ["pay now", "paid ", "upi pay", "scan qr", "make payment", "generate qr"]):
         return "PAYMENT"
     if any(word in text for word in ["checkout", "check out", "clear customer", "end stay"]):
         return "CHECKOUT"
     if any(word in text for word in ["book", "booking", "reserve", "reservation", "need a room", "want a room", "deluxe room", "standard room", "suite room", "room for"]):
         return "BOOK_ROOM"
-    if "food" in text or "biryani" in text or "order" in text:
+    if any(word in text for word in ["food", "biryani", "breakfast", "lunch", "dinner", "meal"]) or (
+        "order" in text and any(f in text for f in ["food", "biryani", "meal", "pizza", "coffee", "tea", "snack"])
+    ):
         return "FOOD_ORDER"
-    if "service" in text or "cleaning" in text or "towel" in text:
+    if any(phrase in text for phrase in ["room service", "housekeeping", "cleaning", "towel", "extra pillow", "need cleaning"]):
         return "ROOM_SERVICE"
     if "recommend" in text:
         return "ROOM_RECOMMEND"
@@ -860,7 +893,7 @@ def detect_action(user_text):
         return "REVIEW"
     if chatbot_model:
         try:
-            return chatbot_model.predict([user_text])[0]
+            return map_ml_intent(chatbot_model.predict([user_text])[0])
         except Exception:
             pass
     return "CHAT"
@@ -1198,6 +1231,165 @@ hr {
     margin: 30px 0;
 }
 
+/* HERO HEADER */
+.hero-card {
+    background: rgba(255,255,255,0.92);
+    border-radius: 28px;
+    padding: 24px 28px;
+    margin-bottom: 24px;
+    border: 1px solid rgba(226,232,240,0.95);
+    box-shadow: 0 16px 45px rgba(15,23,42,0.10);
+}
+.hero-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+.hero-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+.hero-icon {
+    width: 52px;
+    height: 52px;
+    border-radius: 18px;
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    box-shadow: 0 12px 28px rgba(37,99,235,0.28);
+}
+.hero-title {
+    font-size: 32px;
+    font-weight: 900;
+    color: #0f172a !important;
+    margin: 0;
+    line-height: 1.1;
+}
+.hero-subtitle {
+    font-size: 15px;
+    color: #64748b !important;
+    margin-top: 4px;
+}
+.hero-badge {
+    background: linear-gradient(135deg, #f59e0b, #fbbf24);
+    color: #0f172a !important;
+    padding: 10px 16px;
+    border-radius: 999px;
+    font-weight: 800;
+    font-size: 13px;
+}
+
+/* SIDEBAR BRANDING */
+.luxe-logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 18px;
+}
+.luxe-logo-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 14px;
+    background: linear-gradient(135deg, #f59e0b, #fbbf24);
+    color: #0f172a !important;
+    font-weight: 900;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+}
+.luxe-logo-title {
+    font-size: 18px;
+    font-weight: 900;
+    letter-spacing: 1px;
+}
+.luxe-logo-sub {
+    font-size: 11px;
+    opacity: 0.75;
+    letter-spacing: 2px;
+}
+.side-label {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    opacity: 0.7;
+    margin: 12px 0 8px;
+}
+
+/* CUSTOMER CARD */
+.customer-card {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 18px;
+    padding: 14px;
+    margin-bottom: 12px;
+}
+.customer-top {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+.customer-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    background: linear-gradient(135deg, #2563eb, #3b82f6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 900;
+    font-size: 18px;
+}
+.customer-name {
+    font-weight: 800;
+    font-size: 15px;
+}
+.customer-id {
+    font-size: 12px;
+    opacity: 0.7;
+}
+.customer-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    margin-top: 8px;
+    font-size: 13px;
+}
+.customer-row .label {
+    font-size: 11px;
+    opacity: 0.65;
+}
+.customer-row .value {
+    font-weight: 600;
+}
+
+/* STAFF CARD */
+.staff-card {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 16px;
+    padding: 14px;
+    margin-top: 12px;
+}
+
+/* SUGGESTED PROMPT */
+.suggested-prompt {
+    background: rgba(255,255,255,0.92);
+    border: 1px dashed rgba(37,99,235,0.35);
+    border-radius: 16px;
+    padding: 12px 16px;
+    margin-bottom: 12px;
+    color: #0f172a !important;
+    font-size: 14px;
+}
+
 /* MOBILE RESPONSIVE */
 @media screen and (max-width: 768px) {
     .block-container {
@@ -1292,8 +1484,30 @@ def init_session():
         st.session_state.food_data = {"guest_name": None, "room_number": None, "food_item": None, "quantity": None}
     if "service_data" not in st.session_state:
         st.session_state.service_data = {"guest_name": None, "room_number": None, "service_type": None, "message": None}
-    if "voice_question" not in st.session_state:
-        st.session_state.voice_question = ""
+    if "booking_in_progress" not in st.session_state:
+        st.session_state.booking_in_progress = False
+
+
+def reset_booking_form():
+    st.session_state.booking_data = {
+        "guest_name": None, "email": None, "phone": None,
+        "room_type": None, "check_in": None, "check_out": None, "guests": None,
+    }
+    st.session_state.booking_in_progress = False
+
+
+def reset_booking_flow():
+    reset_booking_form()
+    st.session_state.awaiting_payment = False
+
+
+def reset_customer_session():
+    st.session_state.customer_profile = {
+        "customer_id": None, "guest_name": None, "email": None,
+        "phone": None, "room_number": None, "check_out": None,
+    }
+    st.session_state.current_booking = None
+    reset_booking_flow()
 
 
 init_session()
@@ -1368,7 +1582,9 @@ with st.sidebar.container():
     col_login, col_logout = st.columns(2)
     with col_login:
         if st.button("🔐 Login", key="staff_login_btn"):
-            if staff_password_input == STAFF_PASSWORD:
+            if not STAFF_PASSWORD:
+                st.error("Staff password not configured. Set STAFF_PASSWORD in .env or Streamlit secrets.")
+            elif staff_password_input == STAFF_PASSWORD:
                 st.session_state.staff_logged_in = True
                 st.success("Staff login successful.")
             else:
@@ -1439,15 +1655,13 @@ elif page == "💬 AI Hotel Assistant":
     with col_clear:
         if st.button("🔄 Clear Chat / Start New Chat"):
             st.session_state.messages = []
-            st.session_state.booking_data = {"guest_name": None, "email": None, "phone": None, "room_type": None, "check_in": None, "check_out": None, "guests": None}
             st.session_state.food_data = {"guest_name": None, "room_number": None, "food_item": None, "quantity": None}
             st.session_state.service_data = {"guest_name": None, "room_number": None, "service_type": None, "message": None}
+            reset_booking_form()
             st.rerun()
     with col_checkout:
         if st.button("✅ Checkout / Clear Customer"):
-            st.session_state.customer_profile = {"customer_id": None, "guest_name": None, "email": None, "phone": None, "room_number": None, "check_out": None}
-            st.session_state.current_booking = None
-            st.session_state.awaiting_payment = False
+            reset_customer_session()
             st.success("Customer checked out and details cleared.")
             st.rerun()
 
@@ -1456,13 +1670,16 @@ elif page == "💬 AI Hotel Assistant":
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("🏨 Book Room"):
-            st.session_state.chat_prompt = "I need a deluxe room for 2 guests tomorrow"
+            st.session_state.pending_chat_prompt = "I need a deluxe room for 2 guests tomorrow"
+            st.rerun()
     with c2:
         if st.button("🍽 Order Food"):
-            st.session_state.chat_prompt = "Send 2 chicken biryanis to my room"
+            st.session_state.pending_chat_prompt = "Send 2 chicken biryanis to my room"
+            st.rerun()
     with c3:
         if st.button("🛎 Room Service"):
-            st.session_state.chat_prompt = "Need room cleaning"
+            st.session_state.pending_chat_prompt = "Need room cleaning"
+            st.rerun()
 
     with st.expander("📌 Example Commands"):
         st.write("""
@@ -1484,8 +1701,9 @@ checkout
         if voice_text.startswith("Voice-to-text error"):
             st.error(voice_text)
         else:
-            st.session_state.voice_question = voice_text
+            st.session_state.pending_chat_prompt = voice_text
             st.success(f"Recognized text: {voice_text}")
+            st.rerun()
 
     uploaded_file = st.file_uploader("Upload file or image for AI analysis", type=["txt", "pdf", "jpg", "jpeg", "png"])
     file_content = ""
@@ -1510,18 +1728,10 @@ checkout
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    if st.session_state.get("chat_prompt"):
-        st.markdown(f'<div class="suggested-prompt">✨ <b>Suggested prompt</b><br>{st.session_state.chat_prompt}</div>', unsafe_allow_html=True)
-
-    if st.session_state.voice_question:
-        st.info(f"Voice prompt detected: {st.session_state.voice_question}")
-        if st.button("Send Voice Prompt"):
-            st.session_state.pending_voice_prompt = st.session_state.voice_question
-
     user_question = st.chat_input("Ask your AI Hotel Agent...")
-    if "pending_voice_prompt" in st.session_state:
-        user_question = st.session_state.pending_voice_prompt
-        del st.session_state.pending_voice_prompt
+    if "pending_chat_prompt" in st.session_state:
+        user_question = st.session_state.pending_chat_prompt
+        del st.session_state.pending_chat_prompt
 
     if user_question:
         st.session_state.messages.append({"role": "user", "content": user_question})
@@ -1545,7 +1755,12 @@ checkout
                 if txn_text.lower().startswith("paid") or re.match(r"^[A-Za-z0-9]{10,}$", txn_text):
                     intent = "PAYMENT"
 
-            if intent == "PAYMENT":
+            if intent == "CANCEL_BOOKING":
+                reset_booking_form()
+                response_text = "Booking cancelled. You can start a new booking anytime."
+                stream_and_speak(response_text)
+
+            elif intent == "PAYMENT":
                 if command.startswith("verify payment"):
                     if not st.session_state.staff_logged_in:
                         response_text = "Staff access required. Please login from Staff Access section in sidebar."
@@ -1575,9 +1790,7 @@ checkout
                     stream_and_speak(response_text)
 
             elif intent == "CHECKOUT":
-                st.session_state.customer_profile = {"customer_id": None, "guest_name": None, "email": None, "phone": None, "room_number": None, "check_out": None}
-                st.session_state.current_booking = None
-                st.session_state.awaiting_payment = False
+                reset_customer_session()
                 response_text = "Checkout completed. Customer details cleared."
                 stream_and_speak(response_text)
 
@@ -1635,7 +1848,8 @@ checkout
                 response_text = f"Review Sentiment: {result}"
                 stream_and_speak(response_text)
 
-            elif intent == "BOOK_ROOM" or any(v is not None for v in st.session_state.booking_data.values()):
+            elif intent == "BOOK_ROOM" or st.session_state.booking_in_progress:
+                st.session_state.booking_in_progress = True
                 booking = st.session_state.booking_data
                 if "," in user_question:
                     parts = [x.strip() for x in user_question.split(",")]
@@ -1698,9 +1912,8 @@ Please provide: {', '.join(missing)}
                 else:
                     response_text = book_room_from_chat(booking["guest_name"], booking["email"], booking["phone"], booking["room_type"], booking["check_in"], booking["check_out"], int(booking["guests"]))
                     if "Room booked successfully" in response_text:
-                        st.session_state.awaiting_payment = True
                         show_payment_breakdown_and_qr(st.session_state.current_booking)
-                        st.session_state.booking_data = {"guest_name": None, "email": None, "phone": None, "room_type": None, "check_in": None, "check_out": None, "guests": None}
+                        reset_booking_form()
                     stream_and_speak(response_text)
 
             elif intent == "FOOD_ORDER":
